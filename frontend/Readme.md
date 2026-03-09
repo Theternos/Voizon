@@ -1,0 +1,1 @@
+npm install @lottiefiles/dotlottie-react lucide-react firebase react-router-dom

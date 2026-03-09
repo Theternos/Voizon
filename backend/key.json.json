@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "ternos-voizon",
+  "private_key_id": "09efdcb7f7c392e181741d354db9d87a1c3eac9e",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDnuKvH/WYTcTkz\ninBVhgBQWWyYaAF2AuFMkN2BoI3/prAHk7ScUczF3R3yl6eqZfWy5O4atayAcJ/a\nz1i8LrQltc/HiMdLw7y4CeH6j1ApH5oknunNuM0s8QgYV4AogdAsgh5TzPETAtTZ\ngPTuW4197gz5DbCzeEQQ3ZzYlI9S/2xdZxTjQh9+rv5lDr5CNiGo6qsZia0Njvfp\n9Z6dUjpBAOckQCvLswa0vPs6lIwBikhcvBXkpk3E5cdh+NDavb3xbeoXsC/TQlA7\nVXvMr2ROmwQtx6i6E0f+guqQvVSCw7+dm+xpKKiFY+ZEcGYWxhksplAXOw4jdMca\nI1fEh8eBAgMBAAECggEAA/dN5WEWbEXEIcUAUc5p1sMF3OcgaazFJQJwibi93wuZ\nnrLHmBdXhsykJ+DlnnQa5cJAuwjmy3BiCnFn4Bl48Hfkqji4/h7hber2L0vHQCgj\nNlylif8pCXH7EZbJzqeuI8NHkc3QehYfa4IA1ZjDWrQgDIRp9+00IqL2ymD8jpvG\n07k8E7vY9kg7f/jYKinaAyfmXYtfgJzeezLREwKsNpVfvqrQMERkIigh57G/1lLD\nlFqYviptRc80mSIxB0IFYp/QpjQzUsv8QMsaYeIZKqdVIKE1MdpFS7wJtT7Z1LWp\nnK6FAGJU+pC955NesSjz0Afaz4M6Dg5hx09b2r52eQKBgQD1JlQaHOCx6Fi9TB8s\nlD/YlZZWSaj/2npIDjFoWZ7jBHwe3VILEoGui71lZAEXGoydkiFN0bH3uSTCJARs\ndV0q6yreESvgji5KHdGu1Dh70iM3ezpWN2CycQFFdMaxFzTgM3Bj/WNwKcNDH2kJ\nRNhpPmmFg6zMmYNRfKusH2jS3QKBgQDx+jFD0Gq3wOzLrLOPcO5Tb2pZo+mobtBV\nvWPiaIxU6yL1aRrkkVlrqZaQmxC437up8WKvQHJUk7Zt2fi8tTL3EWYzHbdJ8+td\nmUqRP0mAuSc3uIYDdmGfKOuCQ1d08JGyoHr7WrEH3Fd5pjuWfFV9fyr1H/8wbQTI\nPAHBNi1C9QKBgCWSJjmKS3V4ooEAdZajcdWDt3Kp/1iW5z67zh6r/YnVWiBw0u4X\nfACAMhqj5PbhfsN3bds7VAcfPN70HilxI0I8oGlAQHU91SJOx5//rlhrsDIElMA5\n5Hv0jblTWFAzukrSF1t7rg22mNJksfhVsMUQZ6OqtoT00gdfEABlH++RAoGAYscw\nTy+IMOTHhUlFr3t5PoQP1PHtkz1RPH7ohGcLSisGhUnXmZCgASwkc3lpdR6X3ALW\ntxXG1jHKWcOOH3KUkHkA0EMELGMvJHFMGEjOd4adtMhVpJoxtagdo3pb/DesMlAC\nhBL8i2nuJ5GtZ3vv5iAAaDockScfuaGNUdMM3PUCgYBkXebl8/6dA7qRQLaRbOKO\nS8NHsI3y5H3mhziOVx7WMTAZP4Ms5pFer5DsYdYu9gBZxC8RpoLfYP8nFe/pMuRo\n5l5wfQ8NGRR/qoZhU5r4nUGwBEAFuz2cvxv5m1wrpIemHID9kA2spiOamgZ+fvpO\n3X1cyCiTmSvRH5hr0pEwFQ==\n-----END PRIVATE KEY-----\n",
+  "client_email": "firebase-adminsdk-fbsvc@ternos-voizon.iam.gserviceaccount.com",
+  "client_id": "100203563232486793393",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40ternos-voizon.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}

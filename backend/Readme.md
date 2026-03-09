@@ -1,0 +1,1 @@
+npm install express cors dotenv @google/genai multer uuid path pdf-parse textract html-pdf-node fs-extra marked isomorphic-dompurify razorpay firebase busboy firebase-admin nodemailer @deepgram/sdk cross-fetch

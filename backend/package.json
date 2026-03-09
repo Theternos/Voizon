@@ -1,0 +1,42 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "node index.js",
+    "start": "node index.js",
+    "build": "echo 'No build step required'"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "type": "module",
+  "dependencies": {
+    "@deepgram/sdk": "^4.2.0",
+    "@google-cloud/firestore": "^8.2.0",
+    "@google-cloud/storage": "^7.18.0",
+    "@google/genai": "^1.2.0",
+    "busboy": "^1.6.0",
+    "cors": "^2.8.5",
+    "cross-fetch": "^4.1.0",
+    "csv-parser": "^3.2.0",
+    "csv-writer": "^1.6.0",
+    "dotenv": "^16.5.0",
+    "express": "^5.2.1",
+    "firebase": "^11.8.1",
+    "firebase-admin": "^13.4.0",
+    "fs-extra": "^11.3.0",
+    "html-pdf-node": "^1.0.8",
+    "isomorphic-dompurify": "^2.25.0",
+    "marked": "^15.0.12",
+    "multer": "^2.0.0",
+    "nodemailer": "^7.0.3",
+    "path": "^0.12.7",
+    "pdf-parse": "^1.1.1",
+    "razorpay": "^2.9.6",
+    "textract": "^2.5.0",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.2"
+  }
+}

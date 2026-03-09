@@ -1,0 +1,7 @@
+body {
+  overflow: hidden;
+}
+
+div {
+  white-space: inherit !important;
+}
