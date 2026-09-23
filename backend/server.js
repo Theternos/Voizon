@@ -2,7 +2,6 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import dotenv from "dotenv";
-import { GoogleGenAI } from "@google/genai";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
 import fs from "fs-extra";
@@ -45,11 +44,6 @@ dotenv.config();
 const port = process.env.PORT || 5000;
 const app = express();
 app.use(cors());
-
-// Initialize the Gemini client
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -182,36 +176,187 @@ async function fileExistsInFirebase(filePath) {
   }
 }
 
-// Add this function to your existing code (likely at the top with other imports/functions)
-// Unified model configuration
+// Unified model configuration — all models are free-tier models served via
+// OpenRouter. The API key is not stored per model: it comes from the rotating
+// key pool below, because the free-tier limit is applied per key, not per model.
 const MODEL_CONFIGS = {
-  "Gemini 2.5 Flash": {
-    apiKey: process.env.OPENROUTER_GEMINI_API_KEY,
-    model: "google/gemini-2.5-flash",
+  "Nemotron 3 Super": {
+    model: "nvidia/nemotron-3-super-120b-a12b:free",
     maxTokens: 1200,
   },
-  "GPT-4o Mini": {
-    apiKey: process.env.OPENROUTER_GPT_4O_MINI_API_KEY,
-    model: "openai/gpt-4o-mini",
+  "Nemotron 3 Ultra": {
+    model: "nvidia/nemotron-3-ultra-550b-a55b:free",
     maxTokens: 1200,
   },
-  "LLaMA 3.3 8B": {
-    apiKey: process.env.OPENROUTER_API_KEY,
-    model: "meta-llama/llama-3.3-8b-instruct:free",
+  "Ling 3.0 Flash": {
+    model: "inclusionai/ling-3.0-flash-fin:free",
     maxTokens: 1200,
   },
-  "Mistral 7B": {
-    apiKey: process.env.OPENROUTER_MISTRAL_7B_API_KEY,
-    model: "mistralai/mistral-7b-instruct:free",
+  "Qwen3.8 27B": {
+    model: "qwen/qwen3.8-27b:free",
     maxTokens: 1200,
   },
 };
 
+// ===== OpenRouter API key pool (up to 6 keys, seamless failover) =====
+// OpenRouter meters its free tier per API key per day ("free-models-per-day"),
+// so once a key is spent EVERY model returns 429 for it — the key, not the
+// model, is what must be swapped.
+//
+// To make that swap invisible (no error, no extra latency) the pool never waits
+// for a 429 to discover a spent key. GET /api/v1/key reports the exact figure
+// (free_model_daily_requests) and does not consume the allowance itself, so the
+// pool reads every key's balance at boot, counts down locally as requests are
+// spent, and retires a key the moment it reaches zero. A key is therefore only
+// ever picked when it is known to have quota left; the reactive 429 path below
+// survives purely as a safety net for drift (e.g. keys shared with another
+// machine).
+const OPENROUTER_KEY_PLACEHOLDER = /^REPLACE_WITH_/i;
+const OPENROUTER_KEY_ENDPOINT = "https://openrouter.ai/api/v1/key";
+const KEY_REFRESH_MS = 5 * 60 * 1000; // periodic resync to correct drift
+
+const OPENROUTER_KEYS = [
+  process.env.OPENROUTER_API_KEY,
+  process.env.OPENROUTER_API_KEY_2,
+  process.env.OPENROUTER_API_KEY_3,
+  process.env.OPENROUTER_API_KEY_4,
+  process.env.OPENROUTER_API_KEY_5,
+  process.env.OPENROUTER_API_KEY_6,
+]
+  .map((key, index) => ({ key: (key || "").trim(), slot: index + 1 }))
+  .filter(({ key }) => key && !OPENROUTER_KEY_PLACEHOLDER.test(key));
+
+// slot -> { remaining, limit, cooldownUntil, syncedAt }
+const keyState = new Map(
+  OPENROUTER_KEYS.map(({ slot }) => [
+    slot,
+    { remaining: null, limit: null, cooldownUntil: 0, syncedAt: 0 },
+  ])
+);
+
+const maskKey = (key) => `…${key.slice(-6)}`;
+
+// OpenRouter resets the free daily allowance at UTC midnight.
+const nextDailyReset = () => new Date().setUTCHours(24, 0, 0, 0);
+
+function usableOpenRouterKeys() {
+  const now = Date.now();
+  return OPENROUTER_KEYS.filter(({ slot }) => {
+    const state = keyState.get(slot);
+    if (state.cooldownUntil > now) return false;
+    return state.remaining === null || state.remaining > 0;
+  }).sort(
+    // Spend the roomiest key first so no single key is driven to its limit
+    // mid-interview. Unknown balances sort last but stay usable.
+    (a, b) =>
+      (keyState.get(b.slot).remaining ?? -1) -
+      (keyState.get(a.slot).remaining ?? -1)
+  );
+}
+
+function benchOpenRouterKey(slot, key, resetAt) {
+  const parsed = Number(resetAt);
+  const until =
+    Number.isFinite(parsed) && parsed > Date.now() ? parsed : nextDailyReset();
+
+  const state = keyState.get(slot);
+  state.cooldownUntil = until;
+  state.remaining = 0;
+
+  console.warn(
+    `🔑 Key #${slot} (${maskKey(key)}) out of daily quota — retired until ${new Date(until).toISOString()}. ${usableOpenRouterKeys().length} key(s) still ready.`
+  );
+}
+
+// Counts a spent request locally so the key is retired before it can 429.
+function noteOpenRouterUse(slot, key) {
+  const state = keyState.get(slot);
+  if (typeof state.remaining !== "number") return;
+
+  state.remaining = Math.max(0, state.remaining - 1);
+  if (state.remaining === 0) {
+    state.cooldownUntil = nextDailyReset();
+    console.warn(
+      `🔑 Key #${slot} (${maskKey(key)}) reached its last free request — retired until reset. ${usableOpenRouterKeys().length} key(s) still ready.`
+    );
+  }
+}
+
+// Reads a key's real balance. This endpoint is metadata only: it reports
+// free_model_daily_requests without spending any of it.
+async function syncOpenRouterKey({ slot, key }) {
+  try {
+    const response = await fetch(OPENROUTER_KEY_ENDPOINT, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    const body = await response.json().catch(() => null);
+    const daily = body?.data?.free_model_daily_requests;
+    const state = keyState.get(slot);
+
+    if (!response.ok || !daily) {
+      // Unknown balance: leave the key usable and let the 429 path cover it.
+      state.syncedAt = Date.now();
+      return;
+    }
+
+    state.remaining = daily.remaining;
+    state.limit = daily.limit;
+    state.syncedAt = Date.now();
+    state.cooldownUntil = daily.remaining > 0 ? 0 : nextDailyReset();
+  } catch (err) {
+    keyState.get(slot).syncedAt = Date.now();
+  }
+}
+
+let keySyncPromise = null;
+
+function refreshOpenRouterKeys() {
+  keySyncPromise = Promise.allSettled(OPENROUTER_KEYS.map(syncOpenRouterKey)).then(
+    () => {
+      const summary = OPENROUTER_KEYS.map(
+        ({ slot }) => `#${slot}:${keyState.get(slot).remaining ?? "?"}`
+      ).join(" ");
+      console.log(`🔑 OpenRouter free requests left today — ${summary}`);
+    }
+  );
+  return keySyncPromise;
+}
+
+// Requests arriving before the first sync finishes wait for it rather than
+// gambling on a key that may already be spent.
+function ensureOpenRouterKeysReady() {
+  return keySyncPromise || refreshOpenRouterKeys();
+}
+
+if (OPENROUTER_KEYS.length) {
+  refreshOpenRouterKeys();
+  setInterval(refreshOpenRouterKeys, KEY_REFRESH_MS).unref();
+}
+
+// Distinguishes "this key is spent" from "this model is busy", which need
+// different recovery: a new key vs. a different model.
+function classifyOpenRouterError(status, body) {
+  const error = body?.error || {};
+  const code = Number(error.code) || status;
+  const limitSource = error.metadata?.limit_source || "";
+  const resetAt = error.metadata?.headers?.["X-RateLimit-Reset"];
+  const message = error.message || `OpenRouter error ${code}`;
+
+  if (code === 429 && limitSource === "openrouter_free_tier_daily") {
+    return { kind: "key_exhausted", resetAt, message };
+  }
+  // e.g. limit_source "upstream_provider_shared_pool" — the model is throttled
+  // for everyone, so another key would not help; another model will.
+  if (code === 429) return { kind: "model_limited", message };
+  return { kind: "model_error", message };
+}
+
 const FALLBACK_MODELS = {
-  "Gemini 2.5 Flash": ["GPT-4o Mini", "LLaMA 3.3 8B", "Mistral 7B"],
-  "GPT-4o Mini": ["Gemini 2.5 Flash", "LLaMA 3.3 8B", "Mistral 7B"],
-  "LLaMA 3.3 8B": ["Mistral 7B", "GPT-4o Mini", "Gemini 2.5 Flash"],
-  "Mistral 7B": ["GPT-4o Mini", "Gemini 2.5 Flash", "LLaMA 3.3 8B"],
+  "Nemotron 3 Super": ["Nemotron 3 Ultra", "Ling 3.0 Flash", "Qwen3.8 27B"],
+  "Nemotron 3 Ultra": ["Nemotron 3 Super", "Ling 3.0 Flash", "Qwen3.8 27B"],
+  "Ling 3.0 Flash": ["Nemotron 3 Super", "Nemotron 3 Ultra", "Qwen3.8 27B"],
+  "Qwen3.8 27B": ["Nemotron 3 Super", "Nemotron 3 Ultra", "Ling 3.0 Flash"],
 };
 
 // Generate natural, conversational system prompt
@@ -271,72 +416,27 @@ function normalizeMessages(chat, question, resume) {
   return messages;
 }
 
-// Unified API call function
+// Unified API call function — every model is routed through OpenRouter
 async function callModel(modelName, question, chat = [], resume = "") {
   const config = MODEL_CONFIGS[modelName];
   if (!config) throw new Error(`Unknown model: ${modelName}`);
 
   try {
-    if (config.isGemini) {
-      return await callGeminiModel(question, chat, resume);
-    } else {
-      return await callOpenRouterModel(config, question, chat, resume);
-    }
+    return await callOpenRouterModel(config, question, chat, resume);
   } catch (error) {
     console.error(`❌ ${modelName} failed:`, error.message);
     throw error;
   }
 }
 
-// Gemini-specific handler
-async function callGeminiModel(question, chat, resume) {
-  const contents = [];
-
-  // Add system context
-  contents.push({
-    role: "user",
-    parts: [{ text: createSystemPrompt(resume) }],
-  });
-
-  // Add chat history
-  chat.forEach((entry) => {
-    if (entry.content?.trim()) {
-      contents.push({
-        role: entry.role === "user" ? "user" : "model",
-        parts: [{ text: entry.content.trim() }],
-      });
-    }
-  });
-
-  // Add current question
-  contents.push({
-    role: "user",
-    parts: [{ text: question }],
-  });
-
-  const result = await ai.models.generateContent({
-    model: MODEL_CONFIGS["Gemini 2.5 Flash"].model,
-    contents,
-    generationConfig: {
-      temperature: 0.8,
-      maxOutputTokens: 800,
-      topP: 0.9,
-    },
-  });
-
-  return result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-}
-
-// OpenRouter API handler
-async function callOpenRouterModel(config, question, chat, resume) {
-  const messages = normalizeMessages(chat, question, resume);
-
+// One attempt against OpenRouter with one specific API key.
+async function requestOpenRouter(apiKey, config, messages) {
   const response = await fetch(
     "https://openrouter.ai/api/v1/chat/completions",
     {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${config.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
         "HTTP-Referer": process.env.FRONTEND_URL,
         "X-Title": process.env.YOUR_SITE_NAME,
@@ -350,24 +450,88 @@ async function callOpenRouterModel(config, question, chat, resume) {
         frequency_penalty: 0.3, // Reduce repetition
         presence_penalty: 0.2,
         stream: false,
+        // These free models are hybrid reasoning models — without this they can
+        // silently burn many seconds on hidden chain-of-thought before answering.
+        // Disabling it keeps live-interview responses fast.
+        reasoning: { enabled: false },
       }),
+      // Guard against a single slow/hung provider stalling the whole fallback chain.
+      signal: AbortSignal.timeout(12000),
     }
   );
 
-  if (!response.ok) {
-    const errorData = await response.json();
+  let body = null;
+  try {
+    body = await response.json();
+  } catch (err) {
+    body = null;
+  }
+
+  // OpenRouter reports some failures with HTTP 200 and an `error` field in the
+  // body rather than a non-2xx status, so both shapes are classified here.
+  if (!response.ok || body?.error) {
+    const info = classifyOpenRouterError(response.status, body);
+    if (!info.resetAt) info.resetAt = response.headers.get("X-RateLimit-Reset");
+    const error = new Error(info.message);
+    error.openRouter = info;
+    throw error;
+  }
+
+  const content = body?.choices?.[0]?.message?.content;
+  if (!content) throw new Error("Invalid response structure");
+
+  return content.trim();
+}
+
+// OpenRouter API handler — walks the key pool when a key hits its daily limit.
+async function callOpenRouterModel(config, question, chat, resume) {
+  const messages = normalizeMessages(chat, question, resume);
+
+  if (!OPENROUTER_KEYS.length) {
     throw new Error(
-      `API error: ${response.status} - ${JSON.stringify(errorData)}`
+      "No OpenRouter API key configured — set OPENROUTER_API_KEY in the backend .env"
     );
   }
 
-  const data = await response.json();
+  // Balances are known before a key is chosen, so a spent key is never tried.
+  await ensureOpenRouterKeysReady();
 
-  if (!data.choices?.[0]?.message?.content) {
-    throw new Error("Invalid response structure");
+  let lastError;
+
+  // One pass at most per key: a key that reports exhaustion is benched, so the
+  // next iteration naturally picks up the following one.
+  for (let attempt = 0; attempt < OPENROUTER_KEYS.length; attempt++) {
+    const available = usableOpenRouterKeys();
+    if (!available.length) break;
+
+    const { key, slot } = available[0];
+
+    try {
+      const content = await requestOpenRouter(key, config, messages);
+      noteOpenRouterUse(slot, key);
+      return content;
+    } catch (error) {
+      lastError = error;
+
+      if (error.openRouter?.kind === "key_exhausted") {
+        benchOpenRouterKey(slot, key, error.openRouter.resetAt);
+        continue; // same model, next key
+      }
+
+      // Anything else is a problem with this model, not this key — hand it to
+      // the caller so the model fallback chain can take over.
+      throw error;
+    }
   }
 
-  return data.choices[0].message.content.trim();
+  const soonest = Math.min(
+    ...OPENROUTER_KEYS.map(({ slot }) => keyState.get(slot).cooldownUntil || 0)
+  );
+  const err = new Error(
+    `All ${OPENROUTER_KEYS.length} OpenRouter key(s) are rate-limited${soonest ? ` until ${new Date(soonest).toISOString()}` : ""}`
+  );
+  err.allKeysExhausted = true;
+  throw lastError?.openRouter?.kind === "key_exhausted" ? err : lastError || err;
 }
 
 // Main API endpoint
@@ -379,6 +543,7 @@ app.post("/api/ask", async (req, res) => {
   }
 
   const tryModels = [model, ...(FALLBACK_MODELS[model] || [])];
+  let keysExhausted = false;
 
   for (const currentModel of tryModels) {
     try {
@@ -395,12 +560,55 @@ app.post("/api/ask", async (req, res) => {
       }
     } catch (error) {
       console.error(`❌ ${currentModel} failed:`, error.message);
+      // Every key is spent, so no other model can succeed either — stop early
+      // instead of replaying the same failure for each remaining model.
+      if (error.allKeysExhausted) {
+        keysExhausted = true;
+        break;
+      }
       continue;
     }
   }
 
+  if (keysExhausted) {
+    const soonest = Math.min(
+      ...OPENROUTER_KEYS.map(({ slot }) => keyState.get(slot).cooldownUntil || 0)
+    );
+    return res.status(429).json({
+      error:
+        "Every OpenRouter API key has hit its daily free-tier limit. Add another key to OPENROUTER_API_KEY_2..6 in the backend .env, or wait for the reset.",
+      retryAt: soonest ? new Date(soonest).toISOString() : undefined,
+    });
+  }
+
   return res.status(500).json({
     error: "All models failed to respond. Please try again.",
+  });
+});
+
+// Quick visibility into which keys are live vs. benched (keys are masked).
+app.get("/api/openrouter-status", (req, res) => {
+  const now = Date.now();
+  res.json({
+    keysConfigured: OPENROUTER_KEYS.length,
+    keysAvailable: usableOpenRouterKeys().length,
+    freeRequestsLeftToday: OPENROUTER_KEYS.reduce(
+      (total, { slot }) => total + (keyState.get(slot).remaining || 0),
+      0
+    ),
+    keys: OPENROUTER_KEYS.map(({ key, slot }) => {
+      const state = keyState.get(slot);
+      const benched = state.cooldownUntil > now;
+      return {
+        slot,
+        key: maskKey(key),
+        status: benched ? "exhausted" : "available",
+        remaining: state.remaining,
+        limit: state.limit,
+        availableAt: benched ? new Date(state.cooldownUntil).toISOString() : null,
+        lastCheckedAt: state.syncedAt ? new Date(state.syncedAt).toISOString() : null,
+      };
+    }),
   });
 });
 
@@ -1005,9 +1213,13 @@ app.post("/api/preview-response-pdf", async (req, res) => {
 app.post('/api/create-order', async (req, res) => {
   const { amount, currency, planId } = req.body;
 
+  if (!amount || Number.isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ error: "Invalid amount" });
+  }
+
   const options = {
-    amount: amount,
-    currency: currency,
+    amount: Math.round(amount),
+    currency,
     receipt: `plan_${planId}_${Date.now()}`
   };
 
@@ -1015,6 +1227,7 @@ app.post('/api/create-order', async (req, res) => {
     const order = await razorpay.orders.create(options);
     res.json(order);
   } catch (err) {
+    console.error("create-order failed:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1045,37 +1258,115 @@ app.post('/api/verify-payment', async (req, res) => {
 
 // Create Top-up Order
 app.post('/api/create-topup-order', async (req, res) => {
-  const { amount, currency, mocks, scans, aiAssists } = req.body;
-
-  const options = {
-    amount: amount,
-    currency: currency,
-    receipt: `topup_${mocks}_${scans}_${aiAssists}_${Date.now()}`
-  };
-
   try {
+    const { amount, currency, mocks, scans, aiAssists } = req.body;
+
+    // Validate required fields
+    if (!amount || !currency) {
+      return res.status(400).json({ 
+        error: "Missing required fields: amount and currency are required" 
+      });
+    }
+
+    // Validate amount
+    const numericAmount = parseFloat(amount);
+    if (isNaN(numericAmount) || numericAmount <= 0) {
+      return res.status(400).json({ 
+        error: "Invalid amount: must be a positive number" 
+      });
+    }
+
+    // Validate currency
+    const validCurrencies = ['INR', 'USD'];
+    if (!validCurrencies.includes(currency.toUpperCase())) {
+      return res.status(400).json({ 
+        error: `Invalid currency: must be one of ${validCurrencies.join(', ')}` 
+      });
+    }
+
+    // Validate quantities
+    const mockCount = parseInt(mocks) || 0;
+    const scanCount = parseInt(scans) || 0;
+    const aiAssistCount = parseInt(aiAssists) || 0;
+
+    if (mockCount < 0 || scanCount < 0 || aiAssistCount < 0) {
+      return res.status(400).json({ 
+        error: "Invalid quantities: cannot be negative" 
+      });
+    }
+
+    // Ensure at least one item is being purchased
+    if (mockCount === 0 && scanCount === 0 && aiAssistCount === 0) {
+      return res.status(400).json({ 
+        error: "No items selected for purchase" 
+      });
+    }
+
+    const options = {
+      amount: Math.round(numericAmount), // Ensure integer amount
+      currency: currency.toUpperCase(),
+      receipt: `topup_${mockCount}_${scanCount}_${aiAssistCount}_${Date.now()}`,
+      notes: {
+        mocks: mockCount,
+        scans: scanCount,
+        aiAssists: aiAssistCount
+      }
+    };
+
+    console.log(`Creating top-up order: ${options.amount} ${options.currency} for ${mockCount} mocks, ${scanCount} scans, ${aiAssistCount} AI assists`);
+
     const order = await razorpay.orders.create(options);
     res.json(order);
+    
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Error creating top-up order:", err);
+    res.status(500).json({ 
+      error: "Failed to create payment order. Please try again." 
+    });
   }
 });
 
 // Verify Top-up Payment
 app.post('/api/verify-topup-payment', async (req, res) => {
-  const { razorpay_payment_id, razorpay_order_id, razorpay_signature, mocks, scans, aiAssists, email } = req.body;
-
-  // Validate the payment signature
-  const generated_signature = crypto
-    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-    .update(razorpay_order_id + "|" + razorpay_payment_id)
-    .digest('hex');
-
-  if (generated_signature !== razorpay_signature) {
-    return res.status(400).json({ success: false, error: "Invalid signature" });
-  }
-
   try {
+    const { razorpay_payment_id, razorpay_order_id, razorpay_signature, mocks, scans, aiAssists, email } = req.body;
+
+    // Validate required fields
+    if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature || !email) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Missing required payment details" 
+      });
+    }
+
+    // Validate numeric values
+    const mockCount = parseInt(mocks) || 0;
+    const scanCount = parseInt(scans) || 0;
+    const aiAssistCount = parseInt(aiAssists) || 0;
+
+    if (mockCount < 0 || scanCount < 0 || aiAssistCount < 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Invalid purchase quantities" 
+      });
+    }
+
+    // Validate the payment signature
+    const generated_signature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest('hex');
+
+    if (generated_signature !== razorpay_signature) {
+      console.error("Signature mismatch:", {
+        generated: generated_signature,
+        received: razorpay_signature,
+        order_id: razorpay_order_id,
+        payment_id: razorpay_payment_id
+      });
+      return res.status(400).json({ success: false, error: "Invalid payment signature" });
+    }
+
     const db = admin.firestore();
     const batch = db.batch();
 
@@ -1083,9 +1374,9 @@ app.post('/api/verify-topup-payment', async (req, res) => {
     const topUpRef = db.collection('topUps-history').doc();
     batch.set(topUpRef, {
       email: email,
-      mocks: parseInt(mocks) || 0,
-      scans: parseInt(scans) || 0,
-      aiAssists: parseInt(aiAssists) || 0,
+      mocks: mockCount,
+      scans: scanCount,
+      aiAssists: aiAssistCount,
       purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
       paymentId: razorpay_payment_id,
       orderId: razorpay_order_id,
@@ -1102,18 +1393,18 @@ app.post('/api/verify-topup-payment', async (req, res) => {
       // Document exists - increment values
       const currentData = userTopUpsDoc.data();
       batch.update(userTopUpsRef, {
-        mocks: (currentData.mocks || 0) + parseInt(mocks) || 0,
-        scans: (currentData.scans || 0) + parseInt(scans) || 0,
-        aiAssists: (currentData.aiAssists || 0) + parseInt(aiAssists) || 0,
+        mocks: (currentData.mocks || 0) + mockCount,
+        scans: (currentData.scans || 0) + scanCount,
+        aiAssists: (currentData.aiAssists || 0) + aiAssistCount,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
     } else {
       // Document doesn't exist - create new with initial values
       batch.set(userTopUpsRef, {
         email: email,
-        mocks: parseInt(mocks) || 0,
-        scans: parseInt(scans) || 0,
-        aiAssists: parseInt(aiAssists) || 0,
+        mocks: mockCount,
+        scans: scanCount,
+        aiAssists: aiAssistCount,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
@@ -1122,10 +1413,15 @@ app.post('/api/verify-topup-payment', async (req, res) => {
     // Execute all operations as a single transaction
     await batch.commit();
 
+    console.log(`✅ Top-up processed successfully for ${email}: ${mockCount} mocks, ${scanCount} scans, ${aiAssistCount} AI assists`);
     res.json({ success: true });
+    
   } catch (err) {
     console.error("Error processing top-up:", err);
-    res.status(500).json({ success: false, error: "Database update failed" });
+    res.status(500).json({ 
+      success: false, 
+      error: "Payment processing failed. Please contact support." 
+    });
   }
 });
 
@@ -1408,18 +1704,18 @@ wss.on("connection", async (ws) => {
 
   try {
     dgConn = dg.listen.live({
-      model: "nova-2",
+      model: "nova-3",
       language: "en-US",
       encoding: "linear16",
       sample_rate: 16000,
       channels: 1,
-      interim_results: true,
-      endpointing: 1200, // Longer endpointing for better sentence detection
+      interim_results: true, // streamed straight through for live on-screen text
+      endpointing: 300, // finalize ~300ms after the speaker stops
       smart_format: true,
       punctuate: true,
-      utterance_end_ms: 5000, // Longer utterance detection
+      utterance_end_ms: 1000, // safety net for a missed speech_final
       vad_events: true,
-      no_delay: false, // Allow some delay for better accuracy
+      no_delay: true, // don't trade latency for marginal accuracy
     });
 
     dgConn.on(LiveTranscriptionEvents.Open, () => {
@@ -1434,91 +1730,77 @@ wss.on("connection", async (ws) => {
       );
     });
 
-    // Transcript buffering for sentence combination
-    let transcriptBuffer = "";
-    let bufferTimeout = null;
-    const BUFFER_TIMEOUT_MS = 2000; // Wait 2 seconds for continuation
+    // Finalized-but-not-yet-complete speech for the current utterance. Deepgram
+    // emits several `is_final` segments per sentence and only sets `speech_final`
+    // once the speaker actually stops, so segments are joined here and released
+    // the moment the utterance completes — no fixed waiting period.
+    let pendingFinal = "";
+    let lastConfidence = 1;
+    let flushTimeout = null;
+    const FLUSH_SAFETY_MS = 1500; // only used if speech_final never arrives
+
+    const send = (payload) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ ...payload, timestamp: new Date().toISOString() }));
+      }
+    };
+
+    const flushFinal = (reason) => {
+      if (flushTimeout) {
+        clearTimeout(flushTimeout);
+        flushTimeout = null;
+      }
+      const text = pendingFinal.trim();
+      pendingFinal = "";
+      if (!text) return;
+      console.log(`📡 final (${reason}):`, text);
+      send({
+        type: "transcript",
+        transcript: text,
+        confidence: lastConfidence,
+        is_final: true,
+      });
+    };
 
     dgConn.on(LiveTranscriptionEvents.Transcript, (data) => {
       try {
-        const transcript = data.channel.alternatives[0]?.transcript;
-        const confidence = data.channel.alternatives[0]?.confidence;
-        const is_final = data.is_final;
+        const alt = data.channel?.alternatives?.[0];
+        const transcript = alt?.transcript?.trim();
+        if (!transcript) return;
 
-        if (transcript && transcript.trim()) {
-          console.log(
-            `📡 Transcript (${is_final ? "final" : "interim"}):`,
-            transcript
-          );
+        if (typeof alt.confidence === "number") lastConfidence = alt.confidence;
 
-          if (is_final) {
-            // Add to buffer with proper spacing
-            if (transcriptBuffer.trim()) {
-              transcriptBuffer += " " + transcript.trim();
-            } else {
-              transcriptBuffer = transcript.trim();
-            }
-
-            // Clear existing timeout
-            if (bufferTimeout) {
-              clearTimeout(bufferTimeout);
-            }
-
-            // Set timeout to send buffered transcript
-            bufferTimeout = setTimeout(() => {
-              if (transcriptBuffer.trim()) {
-                console.log(
-                  "📡 Sending combined transcript:",
-                  transcriptBuffer
-                );
-                ws.send(
-                  JSON.stringify({
-                    type: "transcript",
-                    transcript: transcriptBuffer.trim(),
-                    confidence,
-                    is_final: true,
-                    timestamp: new Date().toISOString(),
-                  })
-                );
-                transcriptBuffer = "";
-              }
-            }, BUFFER_TIMEOUT_MS);
-          }
+        if (!data.is_final) {
+          // Interim hypothesis — forward immediately so text appears on screen
+          // while the person is still speaking.
+          send({
+            type: "interim",
+            transcript: (pendingFinal ? pendingFinal + " " : "") + transcript,
+            is_final: false,
+          });
+          return;
         }
+
+        pendingFinal = pendingFinal ? `${pendingFinal} ${transcript}` : transcript;
+
+        if (data.speech_final) {
+          flushFinal("speech_final");
+          return;
+        }
+
+        // Locked-in words, but the sentence is still going: keep the live line
+        // updated and arm a safety flush in case speech_final never lands.
+        send({ type: "interim", transcript: pendingFinal, is_final: false });
+        if (flushTimeout) clearTimeout(flushTimeout);
+        flushTimeout = setTimeout(() => flushFinal("safety-timeout"), FLUSH_SAFETY_MS);
       } catch (err) {
         console.error("❌ Error processing transcript:", err);
       }
     });
 
-    dgConn.on(LiveTranscriptionEvents.UtteranceEnd, (data) => {
-      console.log("🔚 Utterance ended - flushing buffer");
-
-      // Immediately send any buffered transcript on utterance end
-      if (bufferTimeout) {
-        clearTimeout(bufferTimeout);
-        bufferTimeout = null;
-      }
-
-      if (transcriptBuffer.trim()) {
-        console.log("📡 Sending final buffered transcript:", transcriptBuffer);
-        ws.send(
-          JSON.stringify({
-            type: "transcript",
-            transcript: transcriptBuffer.trim(),
-            confidence: 1.0,
-            is_final: true,
-            timestamp: new Date().toISOString(),
-          })
-        );
-        transcriptBuffer = "";
-      }
-
-      ws.send(
-        JSON.stringify({
-          type: "utterance_end",
-          timestamp: new Date().toISOString(),
-        })
-      );
+    dgConn.on(LiveTranscriptionEvents.UtteranceEnd, () => {
+      flushFinal("utterance_end");
+      send({ type: "utterance_end" });
     });
 
     dgConn.on(LiveTranscriptionEvents.Error, (err) => {
@@ -1537,16 +1819,11 @@ wss.on("connection", async (ws) => {
       console.log("🔒 Deepgram connection closed:", closeEvent);
     });
 
-    // Handle incoming audio data
+    // Handle incoming audio data — this runs every audio chunk, so it stays
+    // free of per-chunk logging to avoid adding overhead on the hot path.
     ws.on("message", (msg) => {
       try {
-        // Check if Deepgram connection is ready
         if (dgConn && dgConn.getReadyState() === 1) {
-          console.log(
-            "🔁 Forwarding audio buffer:",
-            msg.byteLength || msg.length,
-            "bytes"
-          );
           dgConn.send(msg);
         } else {
           console.warn("⚠️ Deepgram not ready, discarding audio data");
@@ -1562,8 +1839,8 @@ wss.on("connection", async (ws) => {
       );
 
       // Clear any pending timeouts
-      if (bufferTimeout) {
-        clearTimeout(bufferTimeout);
+      if (flushTimeout) {
+        clearTimeout(flushTimeout);
       }
 
       try {
@@ -1617,7 +1894,7 @@ ${jobDescription}
 """`;
 
   try {
-    const keywordsText = await callModel("Gemini 2.5 Flash", prompt);
+    const keywordsText = await callModel("Nemotron 3 Super", prompt);
 
     // ✅ Remove ```json or ``` wrappers if present
     const cleaned = keywordsText
@@ -1768,7 +2045,7 @@ Return JSON in the following format:
 - Do not return the same number of questions for every section.
 `.trim();
 
-    const generated = await callModel("Gemini 2.5 Flash", prompt);
+    const generated = await callModel("Nemotron 3 Super", prompt);
     const cleaned = generated.replace(/```json|```/g, "").trim();
 
     let questionsData;
@@ -1855,7 +2132,7 @@ Answer: ${answer}
 
 
   try {
-    const evaluationText = await callModel("Gemini 2.5 Flash", prompt);
+    const evaluationText = await callModel("Nemotron 3 Super", prompt);
     const cleaned = evaluationText.replace(/```json|```/g, "").trim();
     const evaluation = JSON.parse(cleaned);
 
@@ -1901,7 +2178,7 @@ Feedback: ${feedback}
 `;
 
   try {
-    const followUpText = await callModel("Gemini 2.5 Flash", prompt);
+    const followUpText = await callModel("Nemotron 3 Super", prompt);
     const cleaned = followUpText.replace(/```json|```/g, "").trim();
     const result = JSON.parse(cleaned);
 
@@ -1943,7 +2220,7 @@ Answer: ${answer}
   `.trim();
 
   // Try each model until one works
-  const tryModels = ["Gemini 2.5 Flash", ...(FALLBACK_MODELS["Gemini 2.5 Flash"] || [])];
+  const tryModels = ["Nemotron 3 Super", ...(FALLBACK_MODELS["Nemotron 3 Super"] || [])];
 
   for (const currentModel of tryModels) {
     try {
@@ -2001,7 +2278,7 @@ Avoid markdown or extra text. Focus on specific, actionable insights.
 `;
 
     // Call LLM (Gemini as primary, with fallbacks)
-    const tryModels = ["Gemini 2.5 Flash", ...(FALLBACK_MODELS["Gemini 2.5 Flash"] || [])];
+    const tryModels = ["Nemotron 3 Super", ...(FALLBACK_MODELS["Nemotron 3 Super"] || [])];
 
     for (const model of tryModels) {
       try {
@@ -2222,7 +2499,7 @@ app.post("/api/analyze-resume", async (req, res) => {
 
   // Function to try multiple models for a given prompt
   const tryModels = async (prompt, parseFunction, defaultResponse) => {
-    const models = ["Gemini 2.5 Flash", ...(FALLBACK_MODELS["Gemini 2.5 Flash"] || [])];
+    const models = ["Nemotron 3 Super", ...(FALLBACK_MODELS["Nemotron 3 Super"] || [])];
 
     for (const model of models) {
       try {
@@ -2480,7 +2757,7 @@ ${resumeText}
 
 
 
-    const accomplishmentsResult = await callModel("Gemini 2.5 Flash", accomplishmentsPrompt);
+    const accomplishmentsResult = await callModel("Nemotron 3 Super", accomplishmentsPrompt);
     const accomplishmentsData = parseJSON(accomplishmentsResult, []);
 
     const skillsPrompt = `
@@ -2525,7 +2802,7 @@ ${resumeText}
 `;
 
 
-    const skillsResult = await callModel("Gemini 2.5 Flash", skillsPrompt);
+    const skillsResult = await callModel("Nemotron 3 Super", skillsPrompt);
     const skillsData = parseJSON(skillsResult, []);
 
     // Step 4: Analyze high impact skills
@@ -2584,7 +2861,7 @@ ${jobDescription}
 `;
 
 
-    const highImpactResult = await callModel("Gemini 2.5 Flash", highImpactPrompt);
+    const highImpactResult = await callModel("Nemotron 3 Super", highImpactPrompt);
     const highImpactData = parseJSON(highImpactResult, { title: "Hard Skills", matchPercentage: 0, missingCount: 0, description: "Not analyzed", keywords: [] });
 
     // Step 5: Analyze medium impact skills
@@ -2644,7 +2921,7 @@ ${jobDescription}
     `;
 
 
-    const mediumImpactResult = await callModel("Gemini 2.5 Flash", mediumImpactPrompt);
+    const mediumImpactResult = await callModel("Nemotron 3 Super", mediumImpactPrompt);
     const mediumImpactData = parseJSON(mediumImpactResult, { title: "Soft Skills", matchPercentage: 0, missingCount: 0, description: "Not analyzed", keywords: [] });
 
     // Step 6: Analyze low impact skills
@@ -2708,7 +2985,7 @@ ${jobDescription}
     `;
 
 
-    const lowImpactResult = await callModel("Gemini 2.5 Flash", lowImpactPrompt);
+    const lowImpactResult = await callModel("Nemotron 3 Super", lowImpactPrompt);
     const lowImpactData = parseJSON(lowImpactResult, { title: "Other Skills", matchPercentage: 0, missingCount: 0, description: "Not analyzed", keywords: [] });
 
     // Step 7: Analyze buzzwords
@@ -2761,7 +3038,7 @@ ${resumeText}
 `;
 
 
-    const buzzwordsResult = await callModel("Gemini 2.5 Flash", buzzwordsPrompt);
+    const buzzwordsResult = await callModel("Nemotron 3 Super", buzzwordsPrompt);
     const buzzwordsData = parseJSON(buzzwordsResult, { title: "Overused Buzzwords", description: "Not analyzed", words: [] });
 
     // Step 8: Analyze verbs
@@ -2803,7 +3080,7 @@ ${resumeText}
     """
     `;
 
-    const verbsResult = await callModel("Gemini 2.5 Flash", verbsPrompt);
+    const verbsResult = await callModel("Nemotron 3 Super", verbsPrompt);
     const verbsData = parseJSON(verbsResult, { title: "Verb Strength", description: "Not analyzed", words: [] });
 
     // Step 9: Analyze pronouns
@@ -2845,7 +3122,7 @@ ${resumeText}
     `;
 
 
-    const pronounsResult = await callModel("Gemini 2.5 Flash", pronounsPrompt);
+    const pronounsResult = await callModel("Nemotron 3 Super", pronounsPrompt);
     const pronounsData = parseJSON(pronounsResult, { title: "First-Person Language", description: "Not analyzed", words: [] });
 
     // Step 10: Extract keywords
@@ -2900,7 +3177,7 @@ DO return only a clean JSON array.
 
 `;
 
-    const keywordsResult = await callModel("Gemini 2.5 Flash", keywordsPrompt);
+    const keywordsResult = await callModel("Nemotron 3 Super", keywordsPrompt);
     const keywordsData = parseJSON(keywordsResult, []);
 
     // Step 11: Calculate word count and analyze dates
@@ -3038,7 +3315,7 @@ ${JSON.stringify(initialReportData, null, 2)}
 `;
 
 
-    const finalMatchScoreResult = await callModel("Gemini 2.5 Flash", finalMatchScorePrompt);
+    const finalMatchScoreResult = await callModel("Nemotron 3 Super", finalMatchScorePrompt);
 
     // Parse individual category scores
     const breakdown = parseJSON(finalMatchScoreResult, {
@@ -3081,7 +3358,7 @@ ${JSON.stringify(initialReportData, null, 2)}
     console.error("❌ Resume analysis error:", error);
 
     // Enhanced error handling with fallback models
-    const tryModels = ["GPT-4o Mini", "LLaMA 3.3 8B", "Mistral 7B"];
+    const tryModels = ["Nemotron 3 Super", "Nemotron 3 Ultra", "Ling 3.0 Flash", "Qwen3.8 27B"];
 
     for (const model of tryModels) {
       try {

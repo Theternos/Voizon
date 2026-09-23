@@ -8,6 +8,7 @@ import InterviewPrepare from "./components/practice";
 import MockInterviewAnalysis from "./components/mockInterviewAnalysis";
 import ATSReport from "./components/ats-report";
 import QuestionVault from "./components/question-vault";
+import InterviewCracker from "./components/voizon";
 
 
 
@@ -23,6 +24,7 @@ function App() {
         <Route path="/mock-interview-analysis" element={<MockInterviewAnalysis />}  />
         <Route path="/ats-report" element={<ATSReport />}  />
         <Route path="/vault-voices" element={<QuestionVault />}  />
+        <Route path="/voizon" element={<InterviewCracker />}  />
       </Routes>
     </Router>
   );

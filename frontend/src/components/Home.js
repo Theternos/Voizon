@@ -78,7 +78,7 @@ import {
 
 const plansINR = {
   monthly: {
-    free: {
+    starter: {
       name: "Starter",
       price: 49,
       features: ["4 Mock Interviews", "6 Resume Scans", "1 AI Assist", "Job Portal", "Question Bank"],
@@ -98,7 +98,7 @@ const plansINR = {
     }
   },
   quarterly: {
-    free: {
+    starter: {
       name: "Starter",
       price: 132,
       features: ["12 Mock Interviews", "18 Resume Scans", "3 AI Assists", "Job Portal", "Question Bank"],
@@ -126,7 +126,7 @@ const plansINR = {
 
 const plansUSD = {
   monthly: {
-    free: {
+    starter: {
       name: "Starter",
       price: 1,
       features: ["4 Mock Interviews", "6 Resume Scans", "1 AI Assist", "Job Portal", "Question Bank"],
@@ -146,7 +146,7 @@ const plansUSD = {
     }
   },
   quarterly: {
-    free: {
+    starter: {
       name: "Starter",
       price: 2.7, // ₹132 ~ $2.7
       features: ["12 Mock Interviews", "18 Resume Scans", "3 AI Assists", "Job Portal", "Question Bank"],
@@ -278,8 +278,7 @@ const PlansModal = ({
                 </ul>
                 <button
                   className={`vz-plan-select ${userPlan?.planId === key ? 'current' : ''}`}
-                  onClick={() => handlePlanSelect(key)}
-                >
+                  onClick={() => handlePlanSelect(key, activeTab)}                >
                   {userPlan?.planId === key ? (
                     <>
                       <Check size={16} /> Current Plan
@@ -880,20 +879,30 @@ const Home = () => {
 
   const handleTopUpPurchase = async () => {
     const email = localStorage.getItem("userEmail");
-    if (!email) return;
+    if (!email) {
+      setToastMessage("Please login to make a purchase");
+      setShowToast(true);
+      return;
+    }
 
     const total = calculateTotal();
-    if (total <= 0) return;
+    if (total <= 0) {
+      setToastMessage("Please select items to purchase");
+      setShowToast(true);
+      return;
+    }
 
     try {
       setLoading(true);
+      
+      // Step 1: Create order
       const response = await fetch(`${backend_url}/api/create-topup-order`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          amount: total * 100, // in paise/cents
+          amount: Math.round(total * 100), // in paise/cents
           currency: currency,
           mocks: addOns.mocks,
           scans: addOns.scans,
@@ -901,14 +910,30 @@ const Home = () => {
         }),
       });
 
-      const order = await response.json();
-      await loadRazorpayScript();
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `Failed to create order: ${response.status}`);
+      }
 
+      const order = await response.json();
+      
+      // Step 2: Load Razorpay script
+      try {
+        await loadRazorpayScript();
+      } catch (scriptError) {
+        console.error("Script loading error:", scriptError);
+        setToastMessage("Payment gateway loading failed. Please refresh and try again.");
+        setShowToast(true);
+        return;
+      }
+
+      // Step 3: Initialize Razorpay
       const options = {
         key: process.env.REACT_APP_RAZORPAY_KEY_ID,
         amount: order.amount,
         currency: order.currency,
         name: "Voizon",
+        description: `Top-up: ${addOns.mocks} Mocks, ${addOns.scans} Scans, ${addOns.aiAssists} AI Assists`,
         order_id: order.id,
         handler: async function (response) {
           try {
@@ -928,6 +953,11 @@ const Home = () => {
               }),
             });
 
+            if (!verificationResponse.ok) {
+              const errorData = await verificationResponse.json();
+              throw new Error(errorData.error || `Payment verification failed: ${verificationResponse.status}`);
+            }
+
             const result = await verificationResponse.json();
 
             if (result.success) {
@@ -946,29 +976,40 @@ const Home = () => {
                 aiAssist: (prev.aiAssist || 0) + addOns.aiAssists
               }));
             } else {
-              setToastMessage("Top-up payment verification failed");
+              setToastMessage(result.error || "Payment verification failed");
               setShowToast(true);
             }
           } catch (error) {
             console.error("Error processing top-up verification:", error);
-            setToastMessage("Error processing top-up verification");
+            setToastMessage(error.message || "Error processing payment verification");
             setShowToast(true);
           }
         },
         prefill: {
-          name: userName,
+          name: userName || email.split('@')[0],
           email: email,
         },
         theme: {
           color: "#3B82F6",
         },
+        modal: {
+          ondismiss: function() {
+            setToastMessage("Payment cancelled");
+            setShowToast(true);
+          }
+        }
       };
+
+      if (!window.Razorpay) {
+        throw new Error("Razorpay not loaded");
+      }
 
       const rzp = new window.Razorpay(options);
       rzp.open();
+      
     } catch (err) {
       console.error("Error processing top-up payment:", err);
-      setToastMessage("Error processing top-up payment");
+      setToastMessage(err.message || "Payment processing failed. Please try again.");
       setShowToast(true);
     } finally {
       setLoading(false);
@@ -1075,132 +1116,236 @@ const Home = () => {
   };
 
   const loadRazorpayScript = () => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      // Check if Razorpay is already loaded
+      if (window.Razorpay) {
+        resolve(true);
+        return;
+      }
+
       const script = document.createElement("script");
       script.src = "https://checkout.razorpay.com/v1/checkout.js";
       script.onload = () => {
-        resolve(true);
+        if (window.Razorpay) {
+          resolve(true);
+        } else {
+          reject(new Error("Razorpay script loaded but window.Razorpay not available"));
+        }
       };
       script.onerror = () => {
-        resolve(false);
+        reject(new Error("Failed to load Razorpay script"));
       };
       document.body.appendChild(script);
     });
   };
 
-
-  const handlePlanSelect = async (planId) => {
+  const handlePlanSelect = async (planId, billingCycle = 'monthly') => {
     setShowPlansModal(false);
 
     if (userPlan?.planId === planId) {
+      setToastMessage("You are already on this plan");
+      setShowToast(true);
+      return;
+    }
+
+    const email = localStorage.getItem("userEmail");
+    if (!email) {
+      setToastMessage("Please login to upgrade your plan");
+      setShowToast(true);
       return;
     }
 
     const selectedPlan = plans[planId];
+    if (!selectedPlan) {
+      setToastMessage("Invalid plan selected");
+      setShowToast(true);
+      return;
+    }
+
+    // Free plan doesn't require payment
+    if (selectedPlan.priceINR === 0) {
+      try {
+        const startDate = new Date();
+        const endDate = new Date();
+        endDate.setFullYear(endDate.getFullYear() + 80); // 80 years for "lifetime" free
+
+        const formatDate = (date) => {
+          const day = String(date.getDate()).padStart(2, '0');
+          const month = String(date.getMonth() + 1).padStart(2, '0');
+          const year = date.getFullYear();
+          return `${day}/${month}/${year}`;
+        };
+
+        const updatedPlan = {
+          planId: planId,
+          ...selectedPlan,
+          isActive: true,
+          startDate: formatDate(startDate),
+          endDate: formatDate(endDate),
+          aiAssist: selectedPlan.aiAssist || 0,
+          mockInterviews: selectedPlan.mockInterviews || 0,
+          updatedAt: new Date().toISOString()
+        };
+
+        setUserPlan(updatedPlan);
+        await updateDoc(doc(db, "userPlans", email), updatedPlan);
+        
+        setToastMessage("Plan updated successfully!");
+        setShowToast(true);
+      } catch (error) {
+        console.error("Error updating free plan:", error);
+        setToastMessage("Error updating plan");
+        setShowToast(true);
+      }
+      return;
+    }
 
     try {
+      setLoading(true);
+      
+      // Calculate price based on billing cycle
+      let price = selectedPlan.priceINR;
+      if (billingCycle === 'quarterly') {
+        price = selectedPlan.priceINR * 3 * 0.9; // 10% discount for quarterly
+      }
+
       const response = await fetch(`${backend_url}/api/create-order`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          amount: selectedPlan.price * 100, // in paise/cents
+          amount: Math.round(price * 100), // in paise/cents
           currency: currency,
           planId: planId
         }),
       });
 
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `Failed to create order: ${response.status}`);
+      }
+
       const order = await response.json();
-      await loadRazorpayScript();
+      
+      // Load Razorpay script
+      try {
+        await loadRazorpayScript();
+      } catch (scriptError) {
+        console.error("Script loading error:", scriptError);
+        setToastMessage("Payment gateway loading failed. Please refresh and try again.");
+        setShowToast(true);
+        return;
+      }
 
-      const options = {
-        key: process.env.REACT_APP_RAZORPAY_KEY_ID,
-        amount: order.amount,
-        currency: order.currency,
-        name: "Voizon",
-        order_id: order.id,
-        handler: async function (response) {
-          try {
-            const verificationResponse = await fetch(`${backend_url}/api/verify-payment`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                razorpay_payment_id: response.razorpay_payment_id,
-                razorpay_order_id: response.razorpay_order_id,
-                razorpay_signature: response.razorpay_signature,
-                planId: planId,
-                email: localStorage.getItem("userEmail")
-              }),
-            });
+    const options = {
+      key: process.env.REACT_APP_RAZORPAY_KEY_ID,
+      amount: order.amount,
+      currency: order.currency,
+      name: "Voizon",
+      description: `${selectedPlan.name} Plan (${billingCycle})`,
+      order_id: order.id,
+      handler: async function (response) {
+        try {
+          const verificationResponse = await fetch(`${backend_url}/api/verify-payment`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              razorpay_payment_id: response.razorpay_payment_id,
+              razorpay_order_id: response.razorpay_order_id,
+              razorpay_signature: response.razorpay_signature,
+              planId: planId,
+              email: email
+            }),
+          });
 
-            const result = await verificationResponse.json();
+          if (!verificationResponse.ok) {
+            const errorData = await verificationResponse.json();
+            throw new Error(errorData.error || `Payment verification failed: ${verificationResponse.status}`);
+          }
 
-            if (result.success) {
-              const startDate = new Date();
-              const endDate = new Date();
-              endDate.setMonth(endDate.getMonth() + 1);
+          const result = await verificationResponse.json();
 
-              const formatDate = (date) => {
-                const day = String(date.getDate()).padStart(2, '0');
-                const month = String(date.getMonth() + 1).padStart(2, '0');
-                const year = date.getFullYear();
-                return `${day}/${month}/${year}`;
-              };
-
-              const updatedPlan = {
-                planId: planId,
-                ...selectedPlan,
-                isActive: true,
-                startDate: formatDate(startDate),
-                endDate: formatDate(endDate),
-                aiAssist: selectedPlan.aiAssist || 0,
-                mockInterviews: selectedPlan.mockInterviews || 0,
-                updatedAt: new Date().toISOString()
-              };
-
-              // Refresh the user plan in state
-              setUserPlan(updatedPlan);
-
-              const email = localStorage.getItem("userEmail");
-              if (email) {
-                await updateDoc(doc(db, "userPlans", email), updatedPlan);
-              }
-
-              setToastMessage("Plan upgraded successfully!");
-              setShowToast(true);
+          if (result.success) {
+            const startDate = new Date();
+            const endDate = new Date();
+            
+            if (billingCycle === 'quarterly') {
+              endDate.setMonth(endDate.getMonth() + 3);
             } else {
-              setToastMessage("Payment verification failed");
-              setShowToast(true);
+              endDate.setMonth(endDate.getMonth() + 1);
             }
-          } catch (error) {
-            console.error("Error processing payment verification:", error);
-            setToastMessage("Error processing payment verification");
+
+            const formatDate = (date) => {
+              const day = String(date.getDate()).padStart(2, '0');
+              const month = String(date.getMonth() + 1).padStart(2, '0');
+              const year = date.getFullYear();
+              return `${day}/${month}/${year}`;
+            };
+
+            const updatedPlan = {
+              planId: planId,
+              ...selectedPlan,
+              billingCycle: billingCycle,
+              priceINR: price,
+              isActive: true,
+              startDate: formatDate(startDate),
+              endDate: formatDate(endDate),
+              aiAssist: selectedPlan.aiAssist || 0,
+              mockInterviews: selectedPlan.mockInterviews || 0,
+              updatedAt: new Date().toISOString()
+            };
+
+            // Refresh user plan in state
+            setUserPlan(updatedPlan);
+            await updateDoc(doc(db, "userPlans", email), updatedPlan);
+
+            setToastMessage("Plan upgraded successfully!");
+            setShowToast(true);
+          } else {
+            setToastMessage(result.error || "Payment verification failed");
             setShowToast(true);
           }
-        },
-        prefill: {
-          name: userName,
-          email: localStorage.getItem("userEmail"),
-        },
-        theme: {
-          color: "#3B82F6",
-        },
-      };
+        } catch (error) {
+          console.error("Error processing payment verification:", error);
+          setToastMessage(error.message || "Error processing payment verification");
+          setShowToast(true);
+        }
+      },
+      prefill: {
+        name: userName || email.split('@')[0],
+        email: email,
+      },
+      theme: {
+        color: "#3B82F6",
+      },
+      modal: {
+        ondismiss: function() {
+          setToastMessage("Payment cancelled");
+          setShowToast(true);
+        }
+      }
+    };
 
-      const rzp = new window.Razorpay(options);
-      rzp.open();
-
-    } catch (err) {
-      console.error("Error processing payment:", err);
-      setToastMessage("Error processing payment");
-      setShowToast(true);
+    if (!window.Razorpay) {
+      throw new Error("Razorpay not loaded");
     }
+
+    const rzp = new window.Razorpay(options);
+    rzp.open();
+    
+  } catch (err) {
+    console.error("Error processing payment:", err);
+    setToastMessage(err.message || "Payment processing failed. Please try again.");
+    setShowToast(true);
+  } finally {
+    setLoading(false);
+  }
   };
 
-  const doesFileExist = async (path) => {
+  const checkProfilePhotoExists = async (path) => {
     const storage = getStorage();
     const folderRef = ref(storage, "profile_pics");
     try {
@@ -1219,13 +1364,8 @@ const Home = () => {
     const photoRef = ref(storage, `profile_pics/${email}.png`);
 
     try {
-      const exists = await doesFileExist(`${email}.png`);
-      if (exists) {
-        const firebaseUrl = await getDownloadURL(photoRef);
-        setUserPhoto(firebaseUrl);
-      } else {
-        setUserPhoto(profile_pic);
-      }
+      const firebaseUrl = await getDownloadURL(photoRef);
+      setUserPhoto(firebaseUrl);
     } catch (err) {
       if (err.code === "storage/object-not-found") {
         if (
@@ -1532,15 +1672,28 @@ const Home = () => {
         safeName
       )}`;
 
+      const response = await fetch(url);
+      if (!response.ok) {
+        let details = "";
+        try {
+          details = (await response.json())?.error || "";
+        } catch (_) { }
+        throw new Error(details || `Report download failed (${response.status})`);
+      }
+
+      const blob = await response.blob();
+      const objectUrl = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = url;
+      a.href = objectUrl;
       a.download = safeName;
-      a.target = "_blank";
       document.body.appendChild(a);
       a.click();
       a.remove();
+      window.URL.revokeObjectURL(objectUrl);
     } catch (err) {
-      alert("Failed to download the report. Try again later.");
+      console.error("Failed to download interview report:", err);
+      setToastMessage("Failed to download the report. Please try again later.");
+      setShowToast(true);
     }
   };
 
@@ -1839,6 +1992,14 @@ const Home = () => {
                       <div className="vz-cta-highlight"></div>
                     </button>
 
+                    <button
+                      className="vz-secondary-cta"
+                      onClick={handleGoLive}
+                    >
+                      <Video size={20} />
+                      <span>Start Interview</span>
+                    </button>
+
                   </div>
                 </div>
 
@@ -1912,6 +2073,22 @@ const Home = () => {
                               {isMobileOrTablet ? "Mocks Left" : "Mock Interviews Left"}
                             </span>
 
+                          </div>
+                        </div>
+
+                        <div className="vz-stat-card">
+                          <div className="vz-stat-icon" style={{ backgroundColor: '#f3e8ff' }}>
+                            <Mic size={20} color="#7c3aed" />
+                          </div>
+                          <div className="vz-stat-content">
+                            <span className="vz-stat-value">
+                              {userPlan.isUnlimited || userPlan.aiAssist === true
+                                ? '∞'
+                                : (userPlan.aiAssist || 0)}
+                            </span>
+                            <span className="vz-stat-label">
+                              {isMobileOrTablet ? "Interviews Left" : "Live Interviews Left"}
+                            </span>
                           </div>
                         </div>
                       </div>
@@ -1992,6 +2169,13 @@ const Home = () => {
                     >
                       <Activity size={18} className="vz-tab-icon" />
                       Practice History
+                    </button>
+                    <button
+                      className={`vz-tab-btn ${activeTab === 'interviews' ? 'vz-tab-active' : ''}`}
+                      onClick={() => setActiveTab('interviews')}
+                    >
+                      <Clock size={18} className="vz-tab-icon" />
+                      Interview History
                     </button>
                   </div>
 

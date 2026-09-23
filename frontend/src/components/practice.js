@@ -95,7 +95,7 @@ const MockInterview = () => {
   const [isRemainingReady, setIsRemainingReady] = useState(false);
   const [isEnding, setIsEnding] = useState(false);
   const [backendStatus, setBackendStatus] = useState("loading");
-  const [selectedModel, setSelectedModel] = useState("Gemini 2.0 Flash");
+  const [selectedModel, setSelectedModel] = useState("Nemotron 3 Super");
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [showInstructionModal, setShowInstructionModal] = useState(

@@ -59,8 +59,6 @@ const InterviewCracker = () => {
   const latestAnswerRef = useRef(null);
 
   // Refs
-  const mediaStreamRef = useRef(null);
-  const recognitionRef = useRef(null);
   const timerIntervalRef = useRef(null);
   const answerDisplayRef = useRef(null);
   const transcriptionDisplayRef = useRef(null);
@@ -87,7 +85,7 @@ const InterviewCracker = () => {
   const startTimestampRef = useRef(null);
   const tickIntervalRef = useRef(null); // controls timer updates
   const lowCreditShownRef = useRef(false);
-  const [selectedModel, setSelectedModel] = useState("Gemini 2.0 Flash");
+  const [selectedModel, setSelectedModel] = useState("Nemotron 3 Super");
   const [showModelMenu, setShowModelMenu] = useState(false);
   const hasLoadedRef = useRef(false);
   const [isDownloading, setIsDownloading] = useState(false);
@@ -96,14 +94,11 @@ const InterviewCracker = () => {
   const [serverUrl, setServerUrl] = useState(`${backend_url}/api/ask`);
   const deepgramSocketRef = useRef(null);
   const SAMPLE_RATE = 16000; // Match backend sample rate
-  const BUFFER_SIZE = 4096;
-  const finalTranscriptBuffer = useRef(""); // Persistent buffer
+  const BUFFER_SIZE = 2048; // 128ms per chunk at 16kHz — smaller = lower latency
   const screenStreamRef = useRef(null); // Store screen stream separately
   const isActiveRef = useRef(false);
   const [showInstructionModal, setShowInstructionModal] = useState(true);
   const [termsAccepted, setTermsAccepted] = useState(false);
-
-  let lastTranscriptTime = useRef(Date.now());
 
   if (process.env.REACT_APP_ENV === "production") {
     console.log = () => { };
@@ -1058,137 +1053,9 @@ const InterviewCracker = () => {
     // Timer state is preserved, not reset
   }, []);
 
-  // 1. Fix the speech recognition useEffect (replace the existing one)
-  useEffect(() => {
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      showStatus(
-        "⚠️ Speech Recognition not available in this browser",
-        "warning"
-      );
-      return;
-    }
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
-    recognition.lang = "en-US";
-
-    recognition.onstart = () => {
-      setIsListening(true);
-      showStatus("🎧 Listening to audio...");
-    };
-
-    recognition.onend = () => {
-      setIsListening(false);
-
-      // Auto-restart if still active
-      if (isActive && mediaStreamRef.current) {
-        setTimeout(() => {
-          if (isActive && recognitionRef.current && mediaStreamRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch (e) { }
-          }
-        }, 100);
-      }
-    };
-
-    recognition.onerror = (event) => {
-      setIsListening(false);
-
-      if (
-        event.error === "not-allowed" ||
-        event.error === "service-not-allowed"
-      ) {
-        showStatus("❌ Microphone access denied", "error");
-        setIsActive(false);
-        return;
-      }
-
-      // Auto-restart on recoverable errors
-      if (
-        isActive &&
-        mediaStreamRef.current &&
-        (event.error === "network" || event.error === "no-speech")
-      ) {
-        setTimeout(() => {
-          if (isActive && recognitionRef.current && mediaStreamRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch (e) { }
-          }
-        }, 1000);
-      }
-    };
-
-    recognition.onresult = (event) => {
-      let finalTranscript = "";
-      let interimTranscript = "";
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
-
-        if (event.results[i].isFinal) {
-          finalTranscript += transcript;
-        } else {
-          interimTranscript += transcript;
-        }
-      }
-
-      // Update live transcription
-      if (interimTranscript.trim()) {
-        setLiveTranscription(interimTranscript.trim());
-      }
-
-      // Process final transcript
-      if (finalTranscript.trim()) {
-        const timestamp = new Date().toLocaleTimeString();
-        const cleanText = finalTranscript.trim();
-        const questionDetected = isQuestion(cleanText);
-
-        const newTranscription = {
-          id: Date.now(),
-          text: cleanText,
-          timestamp,
-          isQuestion: questionDetected,
-          wasAsked: false,
-        };
-
-        setLiveTranscription("");
-
-        if (questionDetected) {
-          // 👇 Don't mark as asked here
-          generateAnswer(cleanText);
-
-          setTranscriptions((prev) => {
-            const updated = prev.map((t) =>
-              t.id === newTranscription.id ? { ...t, wasAsked: true } : t
-            );
-            localStorage.setItem("transcriptions", JSON.stringify(updated));
-            return updated;
-          });
-        }
-
-        setTranscriptions((prev) => {
-          const updated = [newTranscription, ...prev];
-          localStorage.setItem("transcriptions", JSON.stringify(updated));
-          return updated;
-        });
-      }
-    };
-
-    recognitionRef.current = recognition;
-
-    return () => {
-      if (recognition) {
-        recognition.abort();
-      }
-    };
-  }, [isActive, showStatus]);
+  // Question detection now runs entirely off the shared-screen audio pipeline
+  // (Deepgram, via startDeepgramSocket/startTabAudioStreaming below) — the
+  // microphone is never captured, so there is no Web Speech API mic pipeline here.
 
   const getDotColor = (status) => {
     if (status === "ready") return "#22c55e"; // green
@@ -1334,6 +1201,16 @@ const InterviewCracker = () => {
       });
 
       if (!response.ok) {
+        // Every API key is out of free quota for the day — say so plainly
+        // rather than surfacing a generic backend failure.
+        if (response.status === 429) {
+          const info = await response.json().catch(() => ({}));
+          showStatus(
+            info.error || "⚠️ Daily AI request limit reached. Try again later.",
+            "warning"
+          );
+          return;
+        }
         throw new Error(`Backend responded with status: ${response.status}`);
       }
 
@@ -1391,6 +1268,14 @@ const InterviewCracker = () => {
     }
   };
 
+  // The websocket handlers below are created once when capture starts, so calling
+  // generateAnswer directly would keep using that render's chat history and
+  // answers for the whole interview. Go through a ref to always hit the latest.
+  const generateAnswerRef = useRef(generateAnswer);
+  useEffect(() => {
+    generateAnswerRef.current = generateAnswer;
+  });
+
   // ✅ Fix: Parse Deepgram transcripts and update UI
   const startDeepgramSocket = useCallback(
     (stream) => {
@@ -1418,7 +1303,7 @@ const InterviewCracker = () => {
 
         console.log("🧠 Deepgram socket connected");
         deepgramSocketRef.current = socket;
-        showStatus("🎤 Speech recognition active", "success");
+        showStatus("🎧 Transcribing shared screen audio", "success");
         startTabAudioStreaming(stream); // ✅ stream tab audio
       };
 
@@ -1434,60 +1319,48 @@ const InterviewCracker = () => {
               }
               break;
 
-            case "transcript":
-              const { transcript, confidence, is_final } = data;
-              console.log(
-                `🧠 Transcript (${is_final ? "final" : "interim"}):`,
-                transcript
-              );
-
-              if (transcript && transcript.trim()) {
-                if (is_final) {
-                  const now = Date.now();
-                  const timeGap = now - lastTranscriptTime.current;
-
-                  // If last transcript was recent, stitch them
-                  if (timeGap < 1500) {
-                    finalTranscriptBuffer.current += " " + transcript.trim();
-                  } else {
-                    // Time gap too long: treat as new sentence
-                    finalTranscriptBuffer.current = transcript.trim();
-                  }
-
-                  lastTranscriptTime.current = now;
-
-                  // Process stitched sentence
-                  const fullText = finalTranscriptBuffer.current.trim();
-                  const timestamp = new Date().toLocaleTimeString();
-                  const isQ = isQuestion(fullText);
-
-                  const newTranscription = {
-                    id: Date.now(),
-                    text: fullText,
-                    timestamp,
-                    isQuestion: isQ,
-                    wasAsked: false,
-                    confidence: confidence || 0,
-                  };
-
-                  setTranscriptions((prev) => {
-                    const updated = [newTranscription, ...prev];
-                    localStorage.setItem(
-                      "transcriptions",
-                      JSON.stringify(updated)
-                    );
-                    return updated;
-                  });
-
-                  if (isQ && confidence > 0.7) {
-                    generateAnswer(fullText);
-                  }
-
-                  // Clear buffer after use
-                  finalTranscriptBuffer.current = "";
-                }
+            // Words as they are being spoken — display only, never sent to the LLM.
+            case "interim":
+              if (typeof data.transcript === "string") {
+                setLiveTranscription(data.transcript);
               }
               break;
+
+            case "transcript": {
+              const { transcript, confidence } = data;
+              if (!transcript || !transcript.trim()) break;
+
+              const fullText = transcript.trim();
+              const isQ = isQuestion(fullText);
+
+              // Deepgram omits confidence on some final results; treat those
+              // as trustworthy rather than silently dropping the question.
+              const score = typeof confidence === "number" ? confidence : 1;
+              const willAnswer = isQ && score > 0.7;
+
+              // The utterance is complete, so the live line is replaced by it.
+              setLiveTranscription("");
+
+              const newTranscription = {
+                id: Date.now(),
+                text: fullText,
+                timestamp: new Date().toLocaleTimeString(),
+                isQuestion: isQ,
+                wasAsked: willAnswer,
+                confidence: score,
+              };
+
+              setTranscriptions((prev) => {
+                const updated = [newTranscription, ...prev];
+                localStorage.setItem("transcriptions", JSON.stringify(updated));
+                return updated;
+              });
+
+              if (willAnswer) {
+                generateAnswerRef.current(fullText);
+              }
+              break;
+            }
 
             case "utterance_end":
               console.log("🔚 Utterance ended");
@@ -1535,10 +1408,17 @@ const InterviewCracker = () => {
 
   const audioContextRef = useRef(null);
   const processorRef = useRef(null);
+  const silenceCheckRef = useRef(null);
 
   // Cleanup function (call this when component unmounts or stops recording)
   const stopAudioStreaming = useCallback(() => {
+    if (silenceCheckRef.current) {
+      clearTimeout(silenceCheckRef.current);
+      silenceCheckRef.current = null;
+    }
+
     if (processorRef.current) {
+      processorRef.current.onaudioprocess = null;
       processorRef.current.disconnect();
       processorRef.current = null;
     }
@@ -1647,21 +1527,21 @@ const InterviewCracker = () => {
 
   const startCapture = async () => {
     try {
-      showStatus("🎤 Requesting microphone access...");
+      if (!screenStreamRef.current) {
+        showStatus("❌ Share your screen first, then start audio capture", "error");
+        return;
+      }
 
-      if (recognitionRef.current) recognitionRef.current.abort();
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 44100,
-          channelCount: 1,
-        },
-      });
-
-      mediaStreamRef.current = stream;
+      // We only ever transcribe the shared screen/tab audio — never the mic —
+      // so make sure the user actually opted in to sharing audio.
+      const audioTracks = screenStreamRef.current.getAudioTracks();
+      if (audioTracks.length === 0) {
+        showStatus(
+          '❌ No audio detected in the shared screen. Stop sharing, then share again and enable "Share audio"',
+          "error"
+        );
+        return;
+      }
 
       // ✅ Immediately set state and ref
       setIsActive(true);
@@ -1700,23 +1580,9 @@ const InterviewCracker = () => {
         }
       }, 1000);
 
-      // ✅ Delay speech recognition + Deepgram startup to ensure isActiveRef is true
-      setTimeout(() => {
-        if (recognitionRef.current && mediaStreamRef.current) {
-          try {
-            recognitionRef.current.start();
-          } catch (error) {
-            showStatus("❌ Failed to start speech recognition", "error");
-          }
-        }
+      startDeepgramSocket(screenStreamRef.current);
 
-        // ✅ Start Deepgram only after isActiveRef is ready
-        if (screenStreamRef.current) {
-          startDeepgramSocket(screenStreamRef.current);
-        }
-      }, 500);
-
-      showStatus("⚡ Audio capture started - listening for speech!");
+      showStatus("⚡ Audio capture started - listening to shared screen audio!");
     } catch (error) {
       setIsActive(false);
       isActiveRef.current = false;
@@ -1735,22 +1601,7 @@ const InterviewCracker = () => {
       remainingSeconds?.toString() || "0"
     );
 
-    // ✅ Abort speech recognition safely
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.abort();
-      } catch (error) {
-        console.warn("Speech recognition stop failed:", error);
-      }
-    }
-
-    // ✅ Stop mic stream
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-      mediaStreamRef.current = null;
-    }
-
-    // ✅ Stop mic-related timers
+    // ✅ Stop timers
     if (tickIntervalRef.current) {
       clearInterval(tickIntervalRef.current);
       tickIntervalRef.current = null;
@@ -1776,24 +1627,52 @@ const InterviewCracker = () => {
       return;
     }
 
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      showStatus(
+        '❌ The shared screen has no audio track. Re-share with "Share audio" enabled',
+        "error"
+      );
+      return;
+    }
+
     try {
       // Create audio context with the target sample rate
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE,
       });
 
-      const source = audioCtx.createMediaStreamSource(stream);
+      // This runs from the socket's open callback, outside the click handler, so
+      // Chrome may hand back a suspended context — in which case onaudioprocess
+      // never fires and we would silently stream nothing.
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
+
+      // Feed the processor the screen share's audio only (no video track).
+      const source = audioCtx.createMediaStreamSource(
+        new MediaStream(audioTracks)
+      );
 
       // Create a script processor (deprecated but widely supported)
       // For modern browsers, consider using AudioWorklet
       const processor = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+
+      // A ScriptProcessorNode only runs while it's connected to the destination,
+      // but the user already hears the call through their own speakers — routing
+      // it through a silent gain node keeps the callback alive without echoing.
+      const silentGain = audioCtx.createGain();
+      silentGain.gain.value = 0;
 
       // Store references for cleanup
       audioContextRef.current = audioCtx;
       processorRef.current = processor;
 
       source.connect(processor);
-      processor.connect(audioCtx.destination);
+      processor.connect(silentGain);
+      silentGain.connect(audioCtx.destination);
+
+      let heardAudio = false;
 
       processor.onaudioprocess = (e) => {
         if (socket.readyState !== WebSocket.OPEN) {
@@ -1805,11 +1684,16 @@ const InterviewCracker = () => {
 
         // Convert Float32 to Int16 PCM
         const pcmData = new Int16Array(inputData.length);
+        let peak = 0;
         for (let i = 0; i < inputData.length; i++) {
           // Clamp the float32 value to [-1, 1] and convert to 16-bit PCM
           const sample = Math.max(-1, Math.min(1, inputData[i]));
+          const magnitude = sample < 0 ? -sample : sample;
+          if (magnitude > peak) peak = magnitude;
           pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
         }
+
+        if (peak > 0.002) heardAudio = true;
 
         // Send the raw ArrayBuffer
         try {
@@ -1819,7 +1703,19 @@ const InterviewCracker = () => {
         }
       };
 
-      console.log("🎤 Audio streaming started successfully");
+      // Sharing a screen/tab without ticking "Share audio" yields a track that is
+      // permanently silent, so tell the user instead of appearing to work.
+      if (silenceCheckRef.current) clearTimeout(silenceCheckRef.current);
+      silenceCheckRef.current = setTimeout(() => {
+        if (!heardAudio && isActiveRef.current) {
+          showStatus(
+            '⚠️ No sound coming from the shared screen — re-share and enable "Share audio"',
+            "warning"
+          );
+        }
+      }, 10000);
+
+      console.log("🎧 Shared-screen audio streaming started successfully");
     } catch (err) {
       console.error("❌ Error setting up audio streaming:", err);
       showStatus("❌ Audio setup failed", "error");
@@ -1832,16 +1728,33 @@ const InterviewCracker = () => {
       showStatus("🖥️ Starting screen share...");
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
+        // These must stay off for screen/tab audio. They are microphone-oriented
+        // processors: echo cancellation measures what the speakers are playing and
+        // subtracts it, which is precisely the audio we are capturing here, so
+        // leaving it on cancels the interviewer's voice down to near silence.
         audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          sampleRate: 44100,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
         },
+        systemAudio: "include",
       });
 
       screenStreamRef.current = stream; // ✅ Add this line
       setScreenStream(stream); // For UI rendering (video)
-      showStatus("✅ Screen sharing started");
+
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        showStatus(
+          '⚠️ Shared without audio. Stop sharing, share again and tick "Share audio"',
+          "warning"
+        );
+      } else {
+        showStatus("✅ Screen sharing started with audio");
+        audioTracks[0].addEventListener("ended", () => {
+          stopScreenShare();
+        });
+      }
 
       stream.getVideoTracks()[0].addEventListener("ended", () => {
         stopScreenShare();
@@ -1852,11 +1765,22 @@ const InterviewCracker = () => {
   };
 
   const stopScreenShare = () => {
-    if (screenStream) {
-      screenStream.getTracks().forEach((track) => track.stop());
-      setScreenStream(null);
+    const stream = screenStreamRef.current || screenStream;
+
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+    }
+    screenStreamRef.current = null;
+    setScreenStream(null);
+
+    // The shared audio is the only transcription source, so capture cannot
+    // continue once sharing ends.
+    if (isActiveRef.current) {
+      stopCapture();
+    } else {
       stopAudioStreaming(); // will terminate Deepgram connection
     }
+
     showStatus("⏹️ Screen sharing stopped");
   };
 
@@ -1966,10 +1890,10 @@ const InterviewCracker = () => {
   };
 
   const modelDisplayNames = {
-    "Gemini 2.0 Flash": "Gemini 2.0 Flash (Fastest)",
-    "GPT-4o Mini": "GPT-4o Mini",
-    "LLaMA 3.3 8B": "LLaMA 3.3 8B",
-    "Mistral 7B": "Mistral 7B",
+    "Nemotron 3 Super": "Nemotron 3 Super (Fastest)",
+    "Nemotron 3 Ultra": "Nemotron 3 Ultra",
+    "Ling 3.0 Flash": "Ling 3.0 Flash",
+    "Qwen3.8 27B": "Qwen3.8 27B",
   };
 
 
@@ -2318,7 +2242,7 @@ const InterviewCracker = () => {
 
             </div>
             <div style={styles.autoScrollToggle}>
-              Auto Scrollf
+              Auto Scroll
               <div
                 style={{
                   ...styles.toggleSwitch,
@@ -2554,40 +2478,56 @@ const InterviewCracker = () => {
                 generate your report.
               </li>
             </ul>
-            <label
+            <div
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: "10px",
-                marginBottom: "16px",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: "16px",
+                paddingTop: "16px",
+                borderTop: "1px solid #e2e8f0",
               }}
             >
-              <input
-                type="checkbox"
-                checked={termsAccepted}
-                onChange={(e) => setTermsAccepted(e.target.checked)}
-
-              />
-              <span style={{ fontSize: "14px", color: "#475569" }}>
-                I accept the{" "}
-                <a
-                  href="/legal/terms"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style={{ color: "#2563eb", textDecoration: "underline" }}
-                >
-                  Terms & Conditions
-                </a>
-                .
-              </span>
-            </label>
-            <div style={{ textAlign: "right" }}>
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  cursor: "pointer",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={termsAccepted}
+                  onChange={(e) => setTermsAccepted(e.target.checked)}
+                  style={{
+                    flexShrink: 0,
+                    width: "16px",
+                    height: "16px",
+                    cursor: "pointer",
+                  }}
+                />
+                <span style={{ fontSize: "14px", color: "#475569" }}>
+                  I accept the{" "}
+                  <a
+                    href="/legal/terms"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ color: "#2563eb", textDecoration: "underline" }}
+                  >
+                    Terms & Conditions
+                  </a>
+                  .
+                </span>
+              </label>
               <button
                 disabled={!termsAccepted}
                 onClick={() => setShowInstructionModal(false)}
                 style={{
                   ...styles.button,
                   ...styles.primaryButton,
+                  flexShrink: 0,
                   opacity: termsAccepted ? 1 : 0.5,
                   cursor: termsAccepted ? "pointer" : "not-allowed",
                 }}

@@ -596,7 +596,7 @@ const InterviewExperience = () => {
     try {
       const response = await axios.post(`${backend_url}/api/ask`, {
         question: questionText,
-        model: "Gemini 2.0 Flash"
+        model: "Nemotron 3 Super"
       });
       return response.data.answer;
     } catch (err) {
