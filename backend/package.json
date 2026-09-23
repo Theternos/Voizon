@@ -1,10 +1,10 @@
 {
   "name": "server",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "dev": "node index.js",
-    "start": "node index.js",
+    "dev": "node --watch server.js",
+    "start": "node server.js",
     "build": "echo 'No build step required'"
   },
   "keywords": [],
@@ -38,5 +38,8 @@
     "textract": "^2.5.0",
     "uuid": "^11.1.0",
     "ws": "^8.18.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
